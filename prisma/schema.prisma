@@ -1,0 +1,337 @@
+// Clio Invoice App - Prisma Schema
+// Database: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// USER MANAGEMENT
+// ============================================
+
+model User {
+  id        String   @id @default(uuid())
+  clioId    String   @unique @map("clio_id")
+  email     String
+  name      String
+  role      UserRole @default(TIMEKEEPER)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  activities         Activity[]
+  activityEdits      ActivityEdit[]
+  approvalActions    ApprovalAction[]
+  emailNotifications EmailNotification[]
+  mattersAsAttorney  Matter[]            @relation("ResponsibleAttorney")
+
+  // Clio OAuth tokens
+  accessToken  String? @map("access_token")
+  refreshToken String? @map("refresh_token")
+  tokenExpiry  DateTime? @map("token_expiry")
+
+  @@map("users")
+}
+
+enum UserRole {
+  ADMIN
+  RESPONSIBLE_ATTORNEY
+  TIMEKEEPER
+}
+
+// ============================================
+// CLIENT & MATTER MANAGEMENT
+// ============================================
+
+model Client {
+  id             String   @id @default(uuid())
+  clioId         String   @unique @map("clio_id")
+  name           String
+  email          String?
+  isLedesBilling Boolean  @default(false) @map("is_ledes_billing")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  matters Matter[]
+  bills   Bill[]
+
+  @@map("clients")
+}
+
+model Matter {
+  id                    String   @id @default(uuid())
+  clioId                String   @unique @map("clio_id")
+  displayNumber         String?  @map("display_number")
+  description           String?
+  clientId              String?  @map("client_id")
+  responsibleAttorneyId String?  @map("responsible_attorney_id")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  client              Client? @relation(fields: [clientId], references: [id])
+  responsibleAttorney User?   @relation("ResponsibleAttorney", fields: [responsibleAttorneyId], references: [id])
+  bills               Bill[]
+
+  @@map("matters")
+}
+
+// ============================================
+// BILL/INVOICE MANAGEMENT
+// ============================================
+
+model Bill {
+  id         String @id @default(uuid())
+  clioId     String @unique @map("clio_id")
+  billNumber String @map("bill_number")
+  matterId   String? @map("matter_id")
+  clientId   String? @map("client_id")
+
+  // Amounts
+  totalServices Decimal @default(0) @map("total_services") @db.Decimal(10, 2)
+  totalExpenses Decimal @default(0) @map("total_expenses") @db.Decimal(10, 2)
+  totalAmount   Decimal @default(0) @map("total_amount") @db.Decimal(10, 2)
+  discount      Decimal @default(0) @db.Decimal(10, 2)
+
+  // Dates
+  issueDate          DateTime? @map("issue_date")
+  dueDate            DateTime? @map("due_date")
+  billingThroughDate DateTime? @map("billing_through_date")
+
+  // Status tracking
+  clioStatus     String?        @map("clio_status")
+  workflowStatus WorkflowStatus @default(PENDING) @map("workflow_status")
+
+  // Approval tracking
+  firstRoundStartedAt   DateTime? @map("first_round_started_at")
+  firstRoundCompletedAt DateTime? @map("first_round_completed_at")
+  secondRoundStartedAt  DateTime? @map("second_round_started_at")
+  secondRoundCompletedAt DateTime? @map("second_round_completed_at")
+  approvedAt            DateTime? @map("approved_at")
+  sentToClientAt        DateTime? @map("sent_to_client_at")
+
+  // Options
+  skipFirstRound Boolean @default(false) @map("skip_first_round")
+
+  // PDF storage
+  pdfUrl String? @map("pdf_url")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  syncedAt  DateTime @default(now()) @map("synced_at")
+
+  // Relations
+  matter             Matter?             @relation(fields: [matterId], references: [id])
+  client             Client?             @relation(fields: [clientId], references: [id])
+  activities         Activity[]
+  approvalActions    ApprovalAction[]
+  emailNotifications EmailNotification[]
+
+  @@map("bills")
+}
+
+enum WorkflowStatus {
+  PENDING
+  FIRST_ROUND
+  SECOND_ROUND
+  APPROVED
+  SENT
+  VOIDED
+}
+
+// ============================================
+// ACTIVITY MANAGEMENT (Time Entries & Expenses)
+// ============================================
+
+model Activity {
+  id     String       @id @default(uuid())
+  clioId String       @unique @map("clio_id")
+  billId String?      @map("bill_id")
+  type   ActivityType @map("activity_type")
+
+  // Fields
+  date             DateTime
+  timekeeperId     String?  @map("timekeeper_id")
+  activityCategory String?  @map("activity_category")
+  utbmsTaskCode    String?  @map("utbms_task_code")
+  description      String?
+  quantity         Decimal? @db.Decimal(10, 2)
+  rate             Decimal? @db.Decimal(10, 2)
+  total            Decimal? @db.Decimal(10, 2)
+  isBillable       Boolean  @default(true) @map("is_billable")
+
+  // Status
+  status ActivityStatus @default(ACTIVE)
+
+  // Approval tracking
+  approvedByTimekeeper Boolean   @default(false) @map("approved_by_timekeeper")
+  approvedAt           DateTime? @map("approved_at")
+
+  // For expenses
+  vendor        String?
+  expenseCode   String? @map("expense_code")
+  attachmentUrl String? @map("attachment_url")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  syncedAt  DateTime @default(now()) @map("synced_at")
+
+  // Relations
+  bill            Bill?            @relation(fields: [billId], references: [id])
+  timekeeper      User?            @relation(fields: [timekeeperId], references: [id])
+  edits           ActivityEdit[]
+  approvalActions ApprovalAction[]
+
+  @@map("activities")
+}
+
+enum ActivityType {
+  TIME_ENTRY
+  EXPENSE
+}
+
+enum ActivityStatus {
+  ACTIVE
+  HELD
+  DELETED
+}
+
+// ============================================
+// AUDIT & TRACKING
+// ============================================
+
+model ActivityEdit {
+  id         String   @id @default(uuid())
+  activityId String   @map("activity_id")
+  editedById String   @map("edited_by")
+  fieldName  String   @map("field_name")
+  oldValue   String?  @map("old_value")
+  newValue   String?  @map("new_value")
+  editedAt   DateTime @default(now()) @map("edited_at")
+
+  // Relations
+  activity Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  editedBy User     @relation(fields: [editedById], references: [id])
+
+  @@map("activity_edits")
+}
+
+model ApprovalAction {
+  id         String     @id @default(uuid())
+  billId     String     @map("bill_id")
+  activityId String?    @map("activity_id")
+  userId     String     @map("user_id")
+  actionType ActionType @map("action_type")
+  notes      String?
+  createdAt  DateTime   @default(now()) @map("created_at")
+
+  // Relations
+  bill     Bill      @relation(fields: [billId], references: [id], onDelete: Cascade)
+  activity Activity? @relation(fields: [activityId], references: [id])
+  user     User      @relation(fields: [userId], references: [id])
+
+  @@map("approval_actions")
+}
+
+enum ActionType {
+  APPROVE_ENTRY
+  APPROVE_BILL
+  SEND_TO_CLIENT
+  VOID
+  HOLD
+  DELETE
+  EDIT
+}
+
+// ============================================
+// EMAIL NOTIFICATIONS
+// ============================================
+
+model EmailNotification {
+  id               String           @id @default(uuid())
+  billId           String           @map("bill_id")
+  recipientId      String?          @map("recipient_id")
+  recipientEmail   String           @map("recipient_email")
+  notificationType NotificationType @map("notification_type")
+  sentAt           DateTime?        @map("sent_at")
+  openedAt         DateTime?        @map("opened_at")
+  clickedAt        DateTime?        @map("clicked_at")
+  status           EmailStatus      @default(PENDING)
+  approvalToken    String?          @unique @map("approval_token")
+  tokenExpiresAt   DateTime?        @map("token_expires_at")
+
+  // Relations
+  bill      Bill  @relation(fields: [billId], references: [id], onDelete: Cascade)
+  recipient User? @relation(fields: [recipientId], references: [id])
+
+  @@map("email_notifications")
+}
+
+enum NotificationType {
+  FIRST_ROUND_REVIEW
+  SECOND_ROUND_REVIEW
+  INVOICE_SENT
+  REMINDER
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+  OPENED
+  CLICKED
+}
+
+// ============================================
+// APP SETTINGS
+// ============================================
+
+model Setting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+// ============================================
+// SYNC TRACKING
+// ============================================
+
+model SyncLog {
+  id          String     @id @default(uuid())
+  syncType    SyncType   @map("sync_type")
+  status      SyncStatus
+  recordCount Int        @default(0) @map("record_count")
+  errorMessage String?   @map("error_message")
+  startedAt   DateTime   @default(now()) @map("started_at")
+  completedAt DateTime?  @map("completed_at")
+
+  @@map("sync_logs")
+}
+
+enum SyncType {
+  BILLS
+  ACTIVITIES
+  USERS
+  CLIENTS
+  MATTERS
+  FULL
+}
+
+enum SyncStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
