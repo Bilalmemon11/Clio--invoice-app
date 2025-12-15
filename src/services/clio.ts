@@ -13,10 +13,16 @@ import type {
   ClioLineItemResponse,
 } from '@/types/clio'
 
-// Placeholder - will be replaced with actual credentials in Phase 2
-const CLIO_CLIENT_ID = process.env.CLIO_CLIENT_ID || '{{CLIO_CLIENT_ID}}'
-const CLIO_CLIENT_SECRET = process.env.CLIO_CLIENT_SECRET || '{{CLIO_CLIENT_SECRET}}'
-const CLIO_REDIRECT_URI = process.env.CLIO_REDIRECT_URI || 'http://localhost:3000/api/auth/clio/callback'
+// Environment variables
+const CLIO_CLIENT_ID = process.env.CLIO_CLIENT_ID || ''
+const CLIO_CLIENT_SECRET = process.env.CLIO_CLIENT_SECRET || ''
+const CLIO_REDIRECT_URI = process.env.CLIO_REDIRECT_URL || 'http://localhost:3000/api/auth/clio/callback'
+
+// Rate limiting configuration
+const RATE_LIMIT_REQUESTS_PER_SECOND = 4 // Clio allows ~5/sec, we use 4 to be safe
+const RATE_LIMIT_DELAY_MS = 1000 / RATE_LIMIT_REQUESTS_PER_SECOND
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 1000
 
 interface TokenResponse {
   access_token: string
@@ -25,18 +31,32 @@ interface TokenResponse {
   token_type: string
 }
 
+interface TokenUpdateCallback {
+  (accessToken: string, refreshToken: string, expiresAt: Date): Promise<void>
+}
+
+/**
+ * Sleep for a specified number of milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 /**
  * Clio API Client
- * Handles all interactions with the Clio API
+ * Handles all interactions with the Clio API with rate limiting and retry logic
  */
 export class ClioClient {
   private accessToken: string | null = null
   private refreshToken: string | null = null
   private tokenExpiry: Date | null = null
+  private lastRequestTime: number = 0
+  private onTokenUpdate: TokenUpdateCallback | null = null
 
-  constructor(accessToken?: string, refreshToken?: string) {
+  constructor(accessToken?: string, refreshToken?: string, onTokenUpdate?: TokenUpdateCallback) {
     this.accessToken = accessToken || null
     this.refreshToken = refreshToken || null
+    this.onTokenUpdate = onTokenUpdate || null
   }
 
   // ===========================================
@@ -46,13 +66,16 @@ export class ClioClient {
   /**
    * Generate the OAuth authorization URL
    */
-  static getAuthorizationUrl(): string {
+  static getAuthorizationUrl(state?: string): string {
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: CLIO_CLIENT_ID,
       redirect_uri: CLIO_REDIRECT_URI,
       scope: CLIO_SCOPES,
     })
+    if (state) {
+      params.set('state', state)
+    }
     return `${CLIO_AUTH_URL}?${params.toString()}`
   }
 
@@ -113,47 +136,166 @@ export class ClioClient {
     this.refreshToken = tokens.refresh_token
     this.tokenExpiry = new Date(Date.now() + tokens.expires_in * 1000)
 
+    // Call the token update callback if provided
+    if (this.onTokenUpdate) {
+      await this.onTokenUpdate(
+        tokens.access_token,
+        tokens.refresh_token,
+        this.tokenExpiry
+      )
+    }
+
     return tokens
   }
 
+  /**
+   * Check if the access token is expired or about to expire
+   */
+  isTokenExpired(): boolean {
+    if (!this.tokenExpiry) return false
+    // Consider token expired if it expires in less than 5 minutes
+    return this.tokenExpiry.getTime() - Date.now() < 5 * 60 * 1000
+  }
+
   // ===========================================
-  // HTTP Methods
+  // Rate Limiting
   // ===========================================
 
   /**
-   * Make an authenticated request to the Clio API
+   * Apply rate limiting before making a request
+   */
+  private async applyRateLimit(): Promise<void> {
+    const now = Date.now()
+    const timeSinceLastRequest = now - this.lastRequestTime
+
+    if (timeSinceLastRequest < RATE_LIMIT_DELAY_MS) {
+      await sleep(RATE_LIMIT_DELAY_MS - timeSinceLastRequest)
+    }
+
+    this.lastRequestTime = Date.now()
+  }
+
+  // ===========================================
+  // HTTP Methods with Retry Logic
+  // ===========================================
+
+  /**
+   * Make an authenticated request to the Clio API with retry logic
    */
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    retryCount: number = 0
   ): Promise<T> {
     if (!this.accessToken) {
       throw new Error('No access token available')
     }
 
-    const url = `${CLIO_API_BASE}${endpoint}`
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    })
-
-    if (response.status === 401) {
-      // Token expired, try to refresh
+    // Check if token needs refresh
+    if (this.isTokenExpired()) {
       await this.refreshAccessToken()
-      // Retry the request
-      return this.request(endpoint, options)
     }
 
-    if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`Clio API error: ${response.status} - ${error}`)
-    }
+    // Apply rate limiting
+    await this.applyRateLimit()
 
-    return response.json()
+    const url = `${CLIO_API_BASE}${endpoint}`
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      })
+
+      // Handle rate limiting (429)
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After')
+        const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : RETRY_DELAY_MS * (retryCount + 1)
+
+        console.warn(`Rate limited by Clio API. Waiting ${waitTime}ms before retry.`)
+        await sleep(waitTime)
+
+        if (retryCount < MAX_RETRIES) {
+          return this.request(endpoint, options, retryCount + 1)
+        }
+        throw new Error('Rate limit exceeded after maximum retries')
+      }
+
+      // Handle token expiration (401)
+      if (response.status === 401) {
+        console.warn('Token expired. Refreshing...')
+        await this.refreshAccessToken()
+
+        if (retryCount < MAX_RETRIES) {
+          return this.request(endpoint, options, retryCount + 1)
+        }
+        throw new Error('Authentication failed after token refresh')
+      }
+
+      // Handle server errors (5xx) with retry
+      if (response.status >= 500 && retryCount < MAX_RETRIES) {
+        console.warn(`Server error ${response.status}. Retrying in ${RETRY_DELAY_MS}ms...`)
+        await sleep(RETRY_DELAY_MS * (retryCount + 1))
+        return this.request(endpoint, options, retryCount + 1)
+      }
+
+      if (!response.ok) {
+        const error = await response.text()
+        throw new Error(`Clio API error: ${response.status} - ${error}`)
+      }
+
+      // Handle 204 No Content
+      if (response.status === 204) {
+        return {} as T
+      }
+
+      return response.json()
+    } catch (error) {
+      // Retry on network errors
+      if (error instanceof TypeError && error.message.includes('fetch') && retryCount < MAX_RETRIES) {
+        console.warn(`Network error. Retrying in ${RETRY_DELAY_MS}ms...`)
+        await sleep(RETRY_DELAY_MS * (retryCount + 1))
+        return this.request(endpoint, options, retryCount + 1)
+      }
+      throw error
+    }
+  }
+
+  // ===========================================
+  // Pagination Helper
+  // ===========================================
+
+  /**
+   * Fetch all pages of a paginated endpoint
+   */
+  async fetchAllPages<T>(
+    endpoint: string,
+    params: URLSearchParams = new URLSearchParams()
+  ): Promise<T[]> {
+    const allData: T[] = []
+    let pageToken: string | null = null
+
+    do {
+      if (pageToken) {
+        params.set('page_token', pageToken)
+      }
+
+      const response = await this.request<ClioApiResponse<T[]>>(
+        `${endpoint}?${params.toString()}`
+      )
+
+      if (response.data) {
+        allData.push(...response.data)
+      }
+
+      pageToken = response.meta?.paging?.next || null
+    } while (pageToken)
+
+    return allData
   }
 
   // ===========================================
@@ -174,7 +316,7 @@ export class ClioClient {
     const searchParams = new URLSearchParams()
 
     // Add fields to include related data
-    searchParams.set('fields', 'id,etag,number,issued_at,due_at,balance,state,total,sub_total,matter{id,display_number,description},client{id,name},responsible_attorney{id,name}')
+    searchParams.set('fields', 'id,etag,number,issued_at,due_at,balance,state,total,sub_total,pending,discount,tax_sum,secondary_tax_sum,services_secondary_tax,services_sub_total,expenses_secondary_tax,expenses_sub_total,available_state_transitions,start_at,end_at,matter{id,display_number,description,client{id,name}},client{id,name,primary_email_address},responsible_attorney{id,name,email}')
 
     if (params?.state) searchParams.set('state', params.state)
     if (params?.client_id) searchParams.set('client_id', params.client_id.toString())
@@ -194,10 +336,21 @@ export class ClioClient {
   }
 
   /**
+   * Get all bills awaiting approval (handles pagination)
+   */
+  async getAllBillsAwaitingApproval(): Promise<ClioBillResponse[]> {
+    const params = new URLSearchParams()
+    params.set('state', 'awaiting_approval')
+    params.set('fields', 'id,etag,number,issued_at,due_at,balance,state,total,sub_total,pending,discount,start_at,end_at,matter{id,display_number,description,client{id,name}},client{id,name,primary_email_address},responsible_attorney{id,name,email}')
+
+    return this.fetchAllPages<ClioBillResponse>('/bills.json', params)
+  }
+
+  /**
    * Get a single bill by ID
    */
   async getBill(id: number): Promise<ClioApiResponse<ClioBillResponse>> {
-    return this.request(`/bills/${id}.json?fields=id,etag,number,issued_at,due_at,balance,state,total,sub_total,matter{id,display_number,description},client{id,name},responsible_attorney{id,name},user{id,name}`)
+    return this.request(`/bills/${id}.json?fields=id,etag,number,issued_at,due_at,balance,state,total,sub_total,pending,discount,tax_sum,start_at,end_at,available_state_transitions,matter{id,display_number,description,client{id,name}},client{id,name,primary_email_address},responsible_attorney{id,name,email}`)
   }
 
   /**
@@ -219,6 +372,18 @@ export class ClioClient {
     })
   }
 
+  /**
+   * Delete/Void a bill
+   */
+  async deleteBill(id: number, etag: string): Promise<void> {
+    await this.request(`/bills/${id}.json`, {
+      method: 'DELETE',
+      headers: {
+        'If-Match': etag,
+      },
+    })
+  }
+
   // ===========================================
   // Line Items (Bill Activities)
   // ===========================================
@@ -227,7 +392,17 @@ export class ClioClient {
    * Get line items for a bill
    */
   async getBillLineItems(billId: number): Promise<ClioApiResponse<ClioLineItemResponse[]>> {
-    return this.request(`/bills/${billId}/line_items.json?fields=id,etag,type,kind,date,description,quantity,price,total,activity{id,type},user{id,name}`)
+    return this.request(`/bills/${billId}/line_items.json?fields=id,etag,type,kind,date,description,quantity,price,total,note,activity{id,type,date,quantity,rate,price,total,note,non_billable,billed,user{id,name,email},matter{id,display_number},activity_description{id,name,utbms_task{id,code,name},utbms_activity{id,code,name}}},user{id,name,email},expense_category{id,name}`)
+  }
+
+  /**
+   * Get all line items for a bill (handles pagination)
+   */
+  async getAllBillLineItems(billId: number): Promise<ClioLineItemResponse[]> {
+    const params = new URLSearchParams()
+    params.set('fields', 'id,etag,type,kind,date,description,quantity,price,total,note,activity{id,type,date,quantity,rate,price,total,note,non_billable,billed,user{id,name,email},matter{id,display_number},activity_description{id,name,utbms_task{id,code,name},utbms_activity{id,code,name}}},user{id,name,email},expense_category{id,name}')
+
+    return this.fetchAllPages<ClioLineItemResponse>(`/bills/${billId}/line_items.json`, params)
   }
 
   // ===========================================
@@ -248,7 +423,7 @@ export class ClioClient {
   }): Promise<ClioApiResponse<ClioActivityResponse[]>> {
     const searchParams = new URLSearchParams()
 
-    searchParams.set('fields', 'id,etag,type,date,quantity,quantity_in_hours,rate,price,total,non_billable,billed,note,user{id,name},matter{id,display_number,description},activity_description{id,name,utbms_task{id,code,name}}')
+    searchParams.set('fields', 'id,etag,type,date,quantity,quantity_in_hours,rate,price,total,non_billable,billed,note,flat_rate,user{id,name,email},matter{id,display_number,description},activity_description{id,name,utbms_task{id,code,name},utbms_activity{id,code,name}},bill{id,number}')
 
     if (params?.bill_id) searchParams.set('bill_id', params.bill_id.toString())
     if (params?.matter_id) searchParams.set('matter_id', params.matter_id.toString())
@@ -265,7 +440,7 @@ export class ClioClient {
    * Get a single activity by ID
    */
   async getActivity(id: number): Promise<ClioApiResponse<ClioActivityResponse>> {
-    return this.request(`/activities/${id}.json?fields=id,etag,type,date,quantity,quantity_in_hours,rate,price,total,non_billable,billed,note,user{id,name},matter{id,display_number,description},activity_description{id,name,utbms_task{id,code,name}}`)
+    return this.request(`/activities/${id}.json?fields=id,etag,type,date,quantity,quantity_in_hours,rate,price,total,non_billable,billed,note,flat_rate,user{id,name,email},matter{id,display_number,description},activity_description{id,name,utbms_task{id,code,name},utbms_activity{id,code,name}},bill{id,number}`)
   }
 
   /**
@@ -279,7 +454,7 @@ export class ClioClient {
       rate: number
       note: string
       non_billable: boolean
-      activity_description_id: number
+      activity_description: { id: number }
     }>,
     etag: string
   ): Promise<ClioApiResponse<ClioActivityResponse>> {
@@ -293,7 +468,7 @@ export class ClioClient {
   }
 
   /**
-   * Delete an activity (soft delete - marks as non-billable)
+   * Delete an activity
    */
   async deleteActivity(id: number, etag: string): Promise<void> {
     await this.request(`/activities/${id}.json`, {
@@ -301,6 +476,21 @@ export class ClioClient {
       headers: {
         'If-Match': etag,
       },
+    })
+  }
+
+  /**
+   * Remove activity from bill (set bill_id to null - "hold")
+   */
+  async holdActivity(id: number, etag: string): Promise<ClioApiResponse<ClioActivityResponse>> {
+    return this.request(`/activities/${id}.json`, {
+      method: 'PATCH',
+      headers: {
+        'If-Match': etag,
+      },
+      body: JSON.stringify({
+        data: { bill: null },
+      }),
     })
   }
 
@@ -318,7 +508,7 @@ export class ClioClient {
   }): Promise<ClioApiResponse<ClioUserResponse[]>> {
     const searchParams = new URLSearchParams()
 
-    searchParams.set('fields', 'id,etag,name,first_name,last_name,email,enabled,type')
+    searchParams.set('fields', 'id,etag,name,first_name,last_name,email,enabled,type,rate')
 
     if (params?.enabled !== undefined) searchParams.set('enabled', params.enabled.toString())
     if (params?.limit) searchParams.set('limit', params.limit.toString())
@@ -328,17 +518,30 @@ export class ClioClient {
   }
 
   /**
+   * Get all users (handles pagination)
+   */
+  async getAllUsers(enabled?: boolean): Promise<ClioUserResponse[]> {
+    const params = new URLSearchParams()
+    params.set('fields', 'id,etag,name,first_name,last_name,email,enabled,type,rate')
+    if (enabled !== undefined) {
+      params.set('enabled', enabled.toString())
+    }
+
+    return this.fetchAllPages<ClioUserResponse>('/users.json', params)
+  }
+
+  /**
    * Get current user (who made the OAuth authorization)
    */
   async getCurrentUser(): Promise<ClioApiResponse<ClioUserResponse>> {
-    return this.request('/users/who_am_i.json?fields=id,etag,name,first_name,last_name,email,enabled,type')
+    return this.request('/users/who_am_i.json?fields=id,etag,name,first_name,last_name,email,enabled,type,rate')
   }
 
   /**
    * Get a single user by ID
    */
   async getUser(id: number): Promise<ClioApiResponse<ClioUserResponse>> {
-    return this.request(`/users/${id}.json?fields=id,etag,name,first_name,last_name,email,enabled,type`)
+    return this.request(`/users/${id}.json?fields=id,etag,name,first_name,last_name,email,enabled,type,rate`)
   }
 
   // ===========================================
@@ -356,7 +559,7 @@ export class ClioClient {
   }): Promise<ClioApiResponse<ClioContactResponse[]>> {
     const searchParams = new URLSearchParams()
 
-    searchParams.set('fields', 'id,etag,name,first_name,last_name,type,primary_email_address{address}')
+    searchParams.set('fields', 'id,etag,name,first_name,last_name,type,primary_email_address,primary_phone_number')
 
     if (params?.type) searchParams.set('type', params.type)
     if (params?.query) searchParams.set('query', params.query)
@@ -370,7 +573,20 @@ export class ClioClient {
    * Get a single contact by ID
    */
   async getContact(id: number): Promise<ClioApiResponse<ClioContactResponse>> {
-    return this.request(`/contacts/${id}.json?fields=id,etag,name,first_name,last_name,type,primary_email_address{address},custom_field_values{id,value,custom_field{id,name}}`)
+    return this.request(`/contacts/${id}.json?fields=id,etag,name,first_name,last_name,type,primary_email_address,primary_phone_number,custom_field_values{id,value,custom_field{id,name}}`)
+  }
+
+  /**
+   * Get all contacts (handles pagination)
+   */
+  async getAllContacts(type?: string): Promise<ClioContactResponse[]> {
+    const params = new URLSearchParams()
+    params.set('fields', 'id,etag,name,first_name,last_name,type,primary_email_address')
+    if (type) {
+      params.set('type', type)
+    }
+
+    return this.fetchAllPages<ClioContactResponse>('/contacts.json', params)
   }
 
   // ===========================================
@@ -389,7 +605,7 @@ export class ClioClient {
   }): Promise<ClioApiResponse<ClioMatterResponse[]>> {
     const searchParams = new URLSearchParams()
 
-    searchParams.set('fields', 'id,etag,display_number,description,status,client{id,name},responsible_attorney{id,name}')
+    searchParams.set('fields', 'id,etag,display_number,description,status,client{id,name},responsible_attorney{id,name,email}')
 
     if (params?.client_id) searchParams.set('client_id', params.client_id.toString())
     if (params?.responsible_attorney_id) searchParams.set('responsible_attorney_id', params.responsible_attorney_id.toString())
@@ -404,13 +620,47 @@ export class ClioClient {
    * Get a single matter by ID
    */
   async getMatter(id: number): Promise<ClioApiResponse<ClioMatterResponse>> {
-    return this.request(`/matters/${id}.json?fields=id,etag,display_number,description,status,client{id,name},responsible_attorney{id,name},originating_attorney{id,name}`)
+    return this.request(`/matters/${id}.json?fields=id,etag,display_number,description,status,client{id,name},responsible_attorney{id,name,email},originating_attorney{id,name}`)
+  }
+
+  // ===========================================
+  // Activity Descriptions (UTBMS Codes)
+  // ===========================================
+
+  /**
+   * Get activity descriptions (for UTBMS codes)
+   */
+  async getActivityDescriptions(params?: {
+    limit?: number
+    page_token?: string
+  }): Promise<ClioApiResponse<any[]>> {
+    const searchParams = new URLSearchParams()
+    searchParams.set('fields', 'id,name,utbms_task{id,code,name},utbms_activity{id,code,name}')
+
+    if (params?.limit) searchParams.set('limit', params.limit.toString())
+    if (params?.page_token) searchParams.set('page_token', params.page_token)
+
+    return this.request(`/activity_descriptions.json?${searchParams.toString()}`)
+  }
+
+  /**
+   * Get all activity descriptions (handles pagination)
+   */
+  async getAllActivityDescriptions(): Promise<any[]> {
+    const params = new URLSearchParams()
+    params.set('fields', 'id,name,utbms_task{id,code,name},utbms_activity{id,code,name}')
+
+    return this.fetchAllPages('/activity_descriptions.json', params)
   }
 }
 
-// Export singleton instance for server-side usage
-export const createClioClient = (accessToken: string, refreshToken?: string) => {
-  return new ClioClient(accessToken, refreshToken)
+// Export factory function for creating clients
+export const createClioClient = (
+  accessToken: string,
+  refreshToken?: string,
+  onTokenUpdate?: TokenUpdateCallback
+) => {
+  return new ClioClient(accessToken, refreshToken, onTokenUpdate)
 }
 
 export default ClioClient

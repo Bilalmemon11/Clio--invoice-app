@@ -32,9 +32,9 @@ model User {
   mattersAsAttorney  Matter[]            @relation("ResponsibleAttorney")
 
   // Clio OAuth tokens
-  accessToken  String? @map("access_token")
-  refreshToken String? @map("refresh_token")
-  tokenExpiry  DateTime? @map("token_expiry")
+  accessToken    String?   @map("access_token")
+  refreshToken   String?   @map("refresh_token")
+  tokenExpiresAt DateTime? @map("token_expires_at")
 
   @@map("users")
 }
@@ -158,15 +158,16 @@ model Activity {
   type   ActivityType @map("activity_type")
 
   // Fields
-  date             DateTime
-  timekeeperId     String?  @map("timekeeper_id")
-  activityCategory String?  @map("activity_category")
-  utbmsTaskCode    String?  @map("utbms_task_code")
-  description      String?
-  quantity         Decimal? @db.Decimal(10, 2)
-  rate             Decimal? @db.Decimal(10, 2)
-  total            Decimal? @db.Decimal(10, 2)
-  isBillable       Boolean  @default(true) @map("is_billable")
+  date               DateTime
+  timekeeperId       String?  @map("timekeeper_id")
+  activityCategory   String?  @map("activity_category")
+  utbmsTaskCode      String?  @map("utbms_task_code")
+  utbmsActivityCode  String?  @map("utbms_activity_code")
+  description        String?
+  quantity           Decimal? @db.Decimal(10, 2)
+  rate               Decimal? @db.Decimal(10, 2)
+  total              Decimal? @db.Decimal(10, 2)
+  isBillable         Boolean  @default(true) @map("is_billable")
 
   // Status
   status ActivityStatus @default(ACTIVE)
