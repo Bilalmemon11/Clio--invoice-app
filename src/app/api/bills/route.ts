@@ -100,7 +100,7 @@ export async function GET(request: NextRequest) {
       const approvedActivities = bill.activities.filter(a => a.approvedByTimekeeper).length
 
       // Get unique timekeepers
-      const timekeeperIds = [...new Set(bill.activities.map(a => a.timekeeperId).filter(Boolean))]
+      const timekeeperIds = Array.from(new Set(bill.activities.map(a => a.timekeeperId).filter(Boolean)))
 
       return {
         id: bill.id,

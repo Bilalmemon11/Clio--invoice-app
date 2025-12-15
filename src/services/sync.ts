@@ -353,7 +353,7 @@ export async function syncBill(
       totalServices: new Prisma.Decimal(clioBill.services_sub_total || clioBill.sub_total || 0),
       totalExpenses: new Prisma.Decimal(clioBill.expenses_sub_total || 0),
       totalAmount: new Prisma.Decimal(clioBill.total || 0),
-      discount: new Prisma.Decimal(clioBill.discount || 0),
+      discount: new Prisma.Decimal(clioBill.discount?.rate || 0),
       issueDate: clioBill.issued_at ? new Date(clioBill.issued_at) : null,
       dueDate: clioBill.due_at ? new Date(clioBill.due_at) : null,
       billingThroughDate: clioBill.end_at ? new Date(clioBill.end_at) : null,
@@ -432,7 +432,7 @@ export async function syncBillLineItems(
 
         // Get timekeeper user ID
         let timekeeperId: string | null = null
-        const userId = lineItem.user?.id || lineItem.activity?.user?.id
+        const userId = lineItem.user?.id
         if (userId) {
           const user = await prisma.user.findUnique({
             where: { clioId: userId.toString() },
@@ -448,27 +448,24 @@ export async function syncBillLineItems(
           where: { clioId: clioActivityId },
         })
 
-        // Extract UTBMS codes
-        const utbmsTaskCode = lineItem.activity?.activity_description?.utbms_task?.code || null
-        const utbmsActivityCode = lineItem.activity?.activity_description?.utbms_activity?.code || null
-        const activityCategory = lineItem.activity?.activity_description?.name ||
-                                 lineItem.expense_category?.name || null
+        // Activity category will be synced from full activity fetch if needed
+        const activityCategory: string | null = null
 
         const activityData = {
           billId: localBillId,
           type: activityType,
-          date: new Date(lineItem.date || lineItem.activity?.date || new Date()),
+          date: new Date(lineItem.date || new Date()),
           timekeeperId,
           activityCategory,
-          utbmsTaskCode,
-          utbmsActivityCode,
-          description: lineItem.description || lineItem.note || lineItem.activity?.note || null,
+          utbmsTaskCode: null,
+          utbmsActivityCode: null,
+          description: lineItem.description || null,
           quantity: lineItem.quantity ? new Prisma.Decimal(lineItem.quantity) : null,
-          rate: lineItem.activity?.rate ? new Prisma.Decimal(lineItem.activity.rate) : null,
+          rate: lineItem.price ? new Prisma.Decimal(lineItem.price) : null,
           total: lineItem.total ? new Prisma.Decimal(lineItem.total) : null,
-          isBillable: lineItem.activity ? !lineItem.activity.non_billable : true,
+          isBillable: true,
           vendor: null,
-          expenseCode: activityType === ActivityType.EXPENSE ? utbmsActivityCode : null,
+          expenseCode: null,
           syncedAt: new Date(),
         }
 

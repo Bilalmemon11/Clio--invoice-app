@@ -52,6 +52,7 @@ export interface ClioBillResponse {
   services_tax: string
   services_taxable_sub_total: string
   services_secondary_taxable_sub_total: string
+  expenses_sub_total: string
   taxable_sub_total: string
   secondary_taxable_sub_total: string
   sub_total: string
